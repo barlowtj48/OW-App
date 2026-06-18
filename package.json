@@ -1,0 +1,29 @@
+{
+    "author": "Moddable",
+    "dependencies": {},
+    "keywords": [
+        "pebble-app"
+    ],
+    "name": "hello-connected.",
+    "pebble": {
+        "displayName": "JS Connected",
+        "enableMultiJS": true,
+        "messageKeys": [
+            "dummy"
+        ],
+        "projectType": "moddable",
+        "resources": {
+            "media": []
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "emery",
+            "gabbro"
+        ],
+        "uuid": "44bd15cb-2134-41d8-9af8-cbda0d9dd4d9",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.0.0"
+}
