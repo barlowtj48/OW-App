@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>OneWheel Companion</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+
+  <body>
+    <main>
+      <h1>OneWheel Companion</h1>
+
+      <section class="card">
+        <h2>Watch link</h2>
+        <p class="hint">
+          Phase 2 test: push values to the watch over PebbleKit (no board yet).
+        </p>
+
+        <div class="readout">
+          <div class="stat">
+            <span class="label">Battery</span>
+            <span id="battery" class="value">--%</span>
+          </div>
+          <div class="stat">
+            <span class="label">Speed</span>
+            <span id="speed" class="value">-- mph</span>
+          </div>
+        </div>
+
+        <label class="row">
+          <span>Battery %</span>
+          <input id="batterySlider" type="range" min="0" max="100" value="80" />
+        </label>
+        <label class="row">
+          <span>Speed (mph)</span>
+          <input id="speedSlider" type="range" min="0" max="250" value="124" />
+        </label>
+
+        <div class="buttons">
+          <button id="sendBtn">Send once</button>
+          <button id="streamBtn">Start stream</button>
+        </div>
+
+        <p id="status" class="status">Idle</p>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

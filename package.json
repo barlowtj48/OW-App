@@ -7,6 +7,16 @@
     ],
     "name": "ow-app",
     "pebble": {
+        "companionApp": {
+            "android": {
+                "url": "https://github.com/barlowtj48/OW-App",
+                "apps": [
+                    {
+                        "package": "com.owapp.companion"
+                    }
+                ]
+            }
+        },
         "displayName": "OneWheel",
         "messageKeys": [
             "Connected",

@@ -1,0 +1,38 @@
+version: "3"
+
+# Docker-based Capacitor workflow for the OneWheel Pebble companion app.
+# Mirrors the CarpenterCalculator setup: Node + JDK + Android SDK all live inside
+# the Docker image, so the host only needs Docker + Task.
+#
+# Install Task: https://taskfile.dev/installation/
+
+vars:
+  RUN: docker compose -f docker-compose.local.yml run -T --build --rm ow-companion-android sh -lc
+
+tasks:
+  mobile:add:android:
+    desc: Generate the Android Capacitor project in Docker (run once after cloning)
+    cmds:
+      - '{{.RUN}} "npm ci && rm -rf android && npx cap add android && node scripts/ensure-android-resources.mjs"'
+
+  mobile:sync:
+    desc: Sync the web assets and native plugins into the Android project in Docker
+    cmds:
+      - '{{.RUN}} "npm ci && if [ ! -f android/gradlew ]; then npx cap add android; fi && npx cap sync android && node scripts/ensure-android-resources.mjs"'
+
+  build:android:debug:
+    desc: Build an unsigned Android debug APK in Docker
+    cmds:
+      - '{{.RUN}} "npm ci && if [ ! -f android/gradlew ]; then npx cap add android; fi && npx cap sync android && node scripts/ensure-android-resources.mjs && cd android && ./gradlew assembleDebug"'
+      - echo "APK -> companion/android/app/build/outputs/apk/debug/app-debug.apk"
+
+  build:android:release:
+    desc: Build an unsigned Android release APK in Docker
+    cmds:
+      - '{{.RUN}} "npm ci && if [ ! -f android/gradlew ]; then npx cap add android; fi && npx cap sync android && node scripts/ensure-android-resources.mjs && cd android && ./gradlew assembleRelease"'
+      - echo "APK -> companion/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+
+  shell:
+    desc: Open a shell inside the Android build container
+    cmds:
+      - docker compose -f docker-compose.local.yml run --build --rm ow-companion-android bash

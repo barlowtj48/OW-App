@@ -7,7 +7,7 @@
 
 // Set to 1 to animate fake values with no companion attached (emulator gate).
 // Set to 0 for real use so only AppMessage drives the display.
-#define DEBUG_STUB 1
+#define DEBUG_STUB 0
 
 static Window *s_window;
 static TextLayer *s_time_layer;
@@ -28,9 +28,13 @@ static int s_speed_tenths = 0; // mph * 10
 
 static void update_time(void)
 {
-  // Respects the user's 12h/24h setting.
-  clock_copy_time_string(s_time_buffer, sizeof(s_time_buffer));
-  text_layer_set_text(s_time_layer, s_time_buffer);
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  // Force 12-hour format (e.g. "1:05", "12:34"), regardless of system setting.
+  // "%l" is the space-padded 12-hour hour; trim the leading space.
+  strftime(s_time_buffer, sizeof(s_time_buffer), "%l:%M", t);
+  text_layer_set_text(s_time_layer,
+                      s_time_buffer[0] == ' ' ? s_time_buffer + 1 : s_time_buffer);
 }
 
 static void update_stats_display(void)
@@ -164,6 +168,12 @@ static void init(void)
   window_stack_push(s_window, true);
 
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+
+  // Log the generated AppMessage key numbers so the Android companion's
+  // constants can be confirmed to match (read via `pebble logs`).
+  APP_LOG(APP_LOG_LEVEL_INFO, "MSG KEYS: Connected=%d BatteryPercent=%d Speed=%d",
+          (int)MESSAGE_KEY_Connected, (int)MESSAGE_KEY_BatteryPercent,
+          (int)MESSAGE_KEY_Speed);
 
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_inbox_dropped(inbox_dropped_callback);

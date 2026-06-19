@@ -1,0 +1,19 @@
+services:
+  # One image with Node + JDK 21 + Android SDK handles everything: generating the
+  # Capacitor android/ project, syncing the web assets, and building the APK.
+  ow-companion-android:
+    container_name: ow-companion-android
+    build:
+      context: .
+      dockerfile: android.Dockerfile
+    environment:
+      - CAPACITOR_TELEMETRY_DISABLED=1
+    working_dir: /app
+    volumes:
+      - .:/app
+      - ow-companion-node-modules:/app/node_modules
+      - ow-companion-gradle-cache:/root/.gradle
+
+volumes:
+  ow-companion-node-modules:
+  ow-companion-gradle-cache:
