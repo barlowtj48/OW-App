@@ -132,6 +132,7 @@ class OwPebbleBridgePlugin : Plugin() {
     private val loggedScans = HashSet<String>()
     private val challenge = ByteArrayOutputStream()
     private val notifyQueue = ArrayDeque<UUID>()
+    private val readQueue = ArrayDeque<UUID>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scanTimeoutRunnable = Runnable {
         if (scanning) {
@@ -382,21 +383,33 @@ class OwPebbleBridgePlugin : Plugin() {
 
     @SuppressLint("MissingPermission")
     private fun handleRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
-        if (c.uuid != CHAR_FIRMWARE) return
-        firmwareValue = value.copyOf()
-        val fw = uint16(value)
-        Log.d(TAG, "Firmware revision = $fw")
-        if (fw >= GEMINI_FW_MIN) {
-            // Step 2: enable notifications on the UART serial-read characteristic.
-            geminiUnlock = true
-            emitStatus("connecting", "Unlocking board…")
-            val service = g.getService(SERVICE)
-            service?.getCharacteristic(CHAR_SERIAL_READ)?.let { enableNotify(g, it) }
-        } else {
-            // Older firmware streams without a handshake.
-            geminiUnlock = false
-            emitStatus("connected", "Connected")
-            startDataNotifications(g)
+        when (c.uuid) {
+            CHAR_FIRMWARE -> {
+                firmwareValue = value.copyOf()
+                val fw = uint16(value)
+                Log.d(TAG, "Firmware revision = $fw")
+                if (fw >= GEMINI_FW_MIN) {
+                    // Step 2: enable notifications on the UART serial-read characteristic.
+                    geminiUnlock = true
+                    emitStatus("connecting", "Unlocking board…")
+                    val service = g.getService(SERVICE)
+                    service?.getCharacteristic(CHAR_SERIAL_READ)?.let { enableNotify(g, it) }
+                } else {
+                    // Older firmware streams without a handshake.
+                    geminiUnlock = false
+                    emitStatus("connected", "Connected")
+                    startDataNotifications(g)
+                }
+            }
+            // Initial reads (board is idle and only notifies on change).
+            CHAR_BATTERY -> {
+                applyBattery(value)
+                readNext(g)
+            }
+            CHAR_SPEED_RPM -> {
+                applySpeed(value)
+                readNext(g)
+            }
         }
     }
 
@@ -412,18 +425,24 @@ class OwPebbleBridgePlugin : Plugin() {
                     respondToChallenge(g, inkey)
                 }
             }
-            CHAR_BATTERY -> {
-                sBattery = parseBattery(value)
-                sConnected = true
-                pushUpdate(force = true)
-            }
-            CHAR_SPEED_RPM -> {
-                val rpm = uint16(value)
-                sSpeedTenths = (rpm * MPH_PER_RPM * 10.0).toInt().coerceIn(0, 65535)
-                sConnected = true
-                pushUpdate(force = false)
-            }
+            CHAR_BATTERY -> applyBattery(value)
+            CHAR_SPEED_RPM -> applySpeed(value)
         }
+    }
+
+    private fun applyBattery(value: ByteArray) {
+        sBattery = parseBattery(value)
+        sConnected = true
+        Log.d(TAG, "battery = $sBattery%")
+        pushUpdate(force = true)
+    }
+
+    private fun applySpeed(value: ByteArray) {
+        val rpm = uint16(value)
+        sSpeedTenths = (rpm * MPH_PER_RPM * 10.0).toInt().coerceIn(0, 65535)
+        sConnected = true
+        Log.d(TAG, "rpm = $rpm speedTenths = $sSpeedTenths")
+        pushUpdate(force = false)
     }
 
     @SuppressLint("MissingPermission")
@@ -455,9 +474,30 @@ class OwPebbleBridgePlugin : Plugin() {
 
     @SuppressLint("MissingPermission")
     private fun notifyNext(g: BluetoothGatt) {
-        val next = notifyQueue.poll() ?: return
+        val next = notifyQueue.poll()
+        if (next == null) {
+            // All notifications enabled — prime the UI with one read of each
+            // value, since an idle board won't push a notification until
+            // something changes.
+            startInitialReads(g)
+            return
+        }
         val service = g.getService(SERVICE)
         service?.getCharacteristic(next)?.let { enableNotify(g, it) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startInitialReads(g: BluetoothGatt) {
+        readQueue.clear()
+        readQueue.add(CHAR_BATTERY)
+        readQueue.add(CHAR_SPEED_RPM)
+        readNext(g)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readNext(g: BluetoothGatt) {
+        val next = readQueue.poll() ?: return
+        g.getService(SERVICE)?.getCharacteristic(next)?.let { g.readCharacteristic(it) }
     }
 
     @SuppressLint("MissingPermission")
@@ -523,8 +563,14 @@ class OwPebbleBridgePlugin : Plugin() {
                 val launch = runCatching { sender.startAppOnTheWatch(APP_UUID).toString() }
                     .getOrElse { "error: ${it.message}" }
                 Log.d(TAG, "startAppOnTheWatch -> $launch")
-                delay(1500)
-                result = sendToWatch(connected, battery, speedTenths)
+                // The watch takes a moment to bring the app to the foreground
+                // and for the Core app's state to catch up, so retry a few times.
+                for (attempt in 1..6) {
+                    delay(1000)
+                    result = sendToWatch(connected, battery, speedTenths)
+                    if (!needsAppLaunch(result)) break
+                    Log.d(TAG, "watch send retry $attempt -> $result")
+                }
             } finally {
                 launchingApp = false
             }
@@ -566,6 +612,7 @@ class OwPebbleBridgePlugin : Plugin() {
         launchingApp = false
         challenge.reset()
         notifyQueue.clear()
+        readQueue.clear()
         sConnected = false
         emitStatus("disconnected", reason)
         emitUpdate()
