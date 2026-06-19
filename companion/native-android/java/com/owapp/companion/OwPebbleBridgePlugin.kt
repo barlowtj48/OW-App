@@ -28,13 +28,17 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
+import io.rebble.pebblekit2.client.DefaultPebbleAndroidAppPicker
+import io.rebble.pebblekit2.client.DefaultPebbleInfoRetriever
 import io.rebble.pebblekit2.client.DefaultPebbleSender
 import io.rebble.pebblekit2.common.model.PebbleDictionaryItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 import java.util.ArrayDeque
@@ -120,6 +124,8 @@ class OwPebbleBridgePlugin : Plugin() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sender by lazy { DefaultPebbleSender(context.applicationContext) }
+    private val infoRetriever by lazy { DefaultPebbleInfoRetriever(context.applicationContext) }
+    private val appPicker by lazy { DefaultPebbleAndroidAppPicker.getInstance(context.applicationContext) }
 
     // BLE state.
     private var scanner: BluetoothLeScanner? = null
@@ -433,7 +439,7 @@ class OwPebbleBridgePlugin : Plugin() {
     private fun applyBattery(value: ByteArray) {
         sBattery = parseBattery(value)
         sConnected = true
-        Log.d(TAG, "battery = $sBattery%")
+        Log.d(TAG, "battery = $sBattery% raw=${value.toHex()}")
         pushUpdate(force = true)
     }
 
@@ -441,7 +447,7 @@ class OwPebbleBridgePlugin : Plugin() {
         val rpm = uint16(value)
         sSpeedTenths = (rpm * MPH_PER_RPM * 10.0).toInt().coerceIn(0, 65535)
         sConnected = true
-        Log.d(TAG, "rpm = $rpm speedTenths = $sSpeedTenths")
+        Log.d(TAG, "rpm = $rpm speedTenths = $sSpeedTenths raw=${value.toHex()}")
         pushUpdate(force = false)
     }
 
@@ -559,6 +565,7 @@ class OwPebbleBridgePlugin : Plugin() {
         if (needsAppLaunch(result) && !launchingApp) {
             launchingApp = true
             try {
+                logWatchDiagnostics()
                 Log.d(TAG, "Launching watch app $APP_UUID (watch had a different app open)")
                 val launch = runCatching { sender.startAppOnTheWatch(APP_UUID).toString() }
                     .getOrElse { "error: ${it.message}" }
@@ -576,6 +583,31 @@ class OwPebbleBridgePlugin : Plugin() {
             }
         }
         return result
+    }
+
+    /**
+     * Logs what the phone-side Pebble app and the watch actually report, so we
+     * can tell whether [APP_UUID] really matches the app running on the watch
+     * (the cause of a persistent FailedDifferentAppOpen).
+     */
+    private suspend fun logWatchDiagnostics() {
+        runCatching {
+            val selected = appPicker.getCurrentlySelectedApp()
+            val all = appPicker.getAllEligibleApps()
+            Log.d(TAG, "Pebble phone app selected=$selected  allEligible=$all")
+            val watches = withTimeoutOrNull(3000) {
+                infoRetriever.getConnectedWatches().first()
+            } ?: emptyList()
+            Log.d(TAG, "connected watches=${watches.map { "${it.id.value}:${it.name}" }}")
+            for (w in watches) {
+                val active = withTimeoutOrNull(3000) { infoRetriever.getActiveApp(w.id).first() }
+                Log.d(
+                    TAG,
+                    "watch ${w.id.value}: active app = ${active?.id} (${active?.name}) " +
+                        "type=${active?.type}; ourUUID=$APP_UUID match=${active?.id == APP_UUID}",
+                )
+            }
+        }.onFailure { Log.w(TAG, "watch diagnostics failed: ${it.message}") }
     }
 
     private fun needsAppLaunch(result: String): Boolean =
@@ -631,6 +663,8 @@ class OwPebbleBridgePlugin : Plugin() {
         if (value.size < 2) return 0
         return ((value[0].toInt() and 0xFF) shl 8) or (value[1].toInt() and 0xFF)
     }
+
+    private fun ByteArray.toHex(): String = joinToString(" ") { "%02x".format(it) }
 
     override fun handleOnDestroy() {
         super.handleOnDestroy()
