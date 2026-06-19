@@ -7,8 +7,17 @@
 // A collapsible "Developer test" panel keeps the Phase 2 manual sliders so the
 // watch link can be verified without a board.
 
-const OwPebbleBridge = window.Capacitor
-  ? window.Capacitor.registerPlugin("OwPebbleBridge")
+// Resolve the native "OwPebbleBridge" plugin. This is a no-bundler Capacitor
+// app, so the injected native bridge may not expose `registerPlugin` (it threw
+// "registerPlugin is not a function" on device). Custom plugins registered
+// natively are always reachable via `Capacitor.Plugins.<name>`, so prefer that
+// and fall back to `registerPlugin` only when it actually exists.
+const Cap = window.Capacitor;
+const OwPebbleBridge = Cap
+  ? (Cap.Plugins && Cap.Plugins.OwPebbleBridge) ||
+    (typeof Cap.registerPlugin === "function"
+      ? Cap.registerPlugin("OwPebbleBridge")
+      : null)
   : null;
 
 const dot = document.getElementById("dot");
