@@ -33,6 +33,7 @@ import io.rebble.pebblekit2.common.model.PebbleDictionaryItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
@@ -127,7 +128,8 @@ class OwPebbleBridgePlugin : Plugin() {
     private var geminiUnlock = false
     private var keySent = false
     private var firmwareValue: ByteArray? = null
-    private var appLaunched = false
+    private var launchingApp = false
+    private val loggedScans = HashSet<String>()
     private val challenge = ByteArrayOutputStream()
     private val notifyQueue = ArrayDeque<UUID>()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -183,10 +185,9 @@ class OwPebbleBridgePlugin : Plugin() {
         val connected = call.getBoolean("connected", false) == true
         val battery = (call.getInt("battery", 0) ?: 0).coerceIn(0, 100)
         val speed = (call.getInt("speed", 0) ?: 0).coerceIn(0, 65535)
-        ensureAppLaunched()
         scope.launch {
             try {
-                val result = sendToWatch(connected, battery, speed)
+                val result = deliverToWatch(connected, battery, speed)
                 val ret = JSObject()
                 ret.put("result", result)
                 call.resolve(ret)
@@ -211,13 +212,19 @@ class OwPebbleBridgePlugin : Plugin() {
 
         // The OneWheel often does NOT advertise its 128-bit service UUID, and
         // when it's already linked to the phone it may not be advertising at
-        // all. So first look for a board that the system already has a GATT
-        // connection to and connect straight to it.
-        val already = runCatching {
-            manager.getConnectedDevices(BluetoothProfile.GATT)
-        }.getOrDefault(emptyList()).firstOrNull { isOneWheel(it.name, null) }
+        // all. So first look at devices the phone already knows about (active
+        // GATT connections + bonded/paired devices) and connect straight to a
+        // board if one is there.
+        val known = buildList {
+            addAll(runCatching { manager.getConnectedDevices(BluetoothProfile.GATT) }.getOrDefault(emptyList()))
+            addAll(runCatching { adapter.bondedDevices?.toList() }.getOrNull().orEmpty())
+        }
+        known.distinctBy { it.address }.forEach {
+            Log.d(TAG, "known device: name=${it.name} addr=${it.address}")
+        }
+        val already = known.firstOrNull { isOneWheel(it.name, null) }
         if (already != null) {
-            Log.d(TAG, "Connecting to already-linked board ${already.name} ${already.address}")
+            Log.d(TAG, "Connecting to known board ${already.name} ${already.address}")
             emitStatus("connecting", "Connecting to ${already.name ?: already.address}…")
             gatt = already.connectGatt(context, false, gattCallback)
             call.resolve()
@@ -231,6 +238,7 @@ class OwPebbleBridgePlugin : Plugin() {
         }
         scanner = bleScanner
         scanning = true
+        loggedScans.clear()
         emitStatus("scanning", "Searching for board…")
 
         // No service filter: many OneWheel boards don't advertise the service
@@ -256,6 +264,14 @@ class OwPebbleBridgePlugin : Plugin() {
             if (!scanning) return
             val device: BluetoothDevice = result.device
             val name = device.name ?: result.scanRecord?.deviceName
+            // Log every distinct device once so we can see what the board
+            // actually advertises if matching fails.
+            if (loggedScans.add(device.address)) {
+                Log.d(
+                    TAG,
+                    "scan: name=$name addr=${device.address} services=${result.scanRecord?.serviceUuids}",
+                )
+            }
             if (!isOneWheel(name, result.scanRecord?.serviceUuids)) return
             scanning = false
             mainHandler.removeCallbacks(scanTimeoutRunnable)
@@ -281,8 +297,11 @@ class OwPebbleBridgePlugin : Plugin() {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     emitStatus("connecting", "Discovering services…")
-                    // Make sure the watch app is open so it can receive data.
-                    ensureAppLaunched()
+                    // Make sure our app is open on the watch so it can receive data.
+                    scope.launch {
+                        runCatching { sender.startAppOnTheWatch(APP_UUID) }
+                            .onFailure { Log.w(TAG, "startAppOnTheWatch failed", it) }
+                    }
                     g.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -475,7 +494,7 @@ class OwPebbleBridgePlugin : Plugin() {
         val now = System.currentTimeMillis()
         if (force || now - lastWatchSendMs >= 150) {
             lastWatchSendMs = now
-            scope.launch { runCatching { sendToWatch(sConnected, sBattery, sSpeedTenths) } }
+            scope.launch { runCatching { deliverToWatch(sConnected, sBattery, sSpeedTenths) } }
         }
     }
 
@@ -490,15 +509,33 @@ class OwPebbleBridgePlugin : Plugin() {
         return result
     }
 
-    /** Launch the watch app once so it is open and able to receive AppMessages. */
-    private fun ensureAppLaunched() {
-        if (appLaunched) return
-        appLaunched = true
-        scope.launch {
-            runCatching { sender.startAppOnTheWatch() }
-                .onFailure { Log.w(TAG, "startAppOnTheWatch failed", it) }
+    /**
+     * Send to the watch, and if it reports a different app is open (or no app
+     * running), launch our watch app by UUID and send again. The watch refuses
+     * AppMessages unless our app is the one in the foreground.
+     */
+    private suspend fun deliverToWatch(connected: Boolean, battery: Int, speedTenths: Int): String {
+        var result = sendToWatch(connected, battery, speedTenths)
+        if (needsAppLaunch(result) && !launchingApp) {
+            launchingApp = true
+            try {
+                Log.d(TAG, "Launching watch app $APP_UUID (watch had a different app open)")
+                val launch = runCatching { sender.startAppOnTheWatch(APP_UUID).toString() }
+                    .getOrElse { "error: ${it.message}" }
+                Log.d(TAG, "startAppOnTheWatch -> $launch")
+                delay(1500)
+                result = sendToWatch(connected, battery, speedTenths)
+            } finally {
+                launchingApp = false
+            }
         }
+        return result
     }
+
+    private fun needsAppLaunch(result: String): Boolean =
+        result.contains("DifferentApp", ignoreCase = true) ||
+            result.contains("AppNotRunning", ignoreCase = true) ||
+            result.contains("NotRunning", ignoreCase = true)
 
     private fun emitStatus(status: String, message: String) {
         val ev = JSObject()
@@ -526,7 +563,7 @@ class OwPebbleBridgePlugin : Plugin() {
         geminiUnlock = false
         keySent = false
         firmwareValue = null
-        appLaunched = false
+        launchingApp = false
         challenge.reset()
         notifyQueue.clear()
         sConnected = false
