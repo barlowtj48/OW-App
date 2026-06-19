@@ -12,12 +12,14 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
+import android.util.Log
 import com.getcapacitor.JSObject
 import com.getcapacitor.PermissionState
 import com.getcapacitor.Plugin
@@ -72,6 +74,11 @@ import java.util.UUID
 class OwPebbleBridgePlugin : Plugin() {
 
     companion object {
+        private const val TAG = "OwBridge"
+
+        // Stop searching after this long if the board never shows up.
+        private const val SCAN_TIMEOUT_MS = 15000L
+
         // Must match the watch app's UUID (package.json).
         private val APP_UUID = UUID.fromString("44bd15cb-2134-41d8-9af8-cbda0d9dd4d9")
 
@@ -119,8 +126,22 @@ class OwPebbleBridgePlugin : Plugin() {
     private var scanning = false
     private var geminiUnlock = false
     private var keySent = false
+    private var firmwareValue: ByteArray? = null
+    private var appLaunched = false
     private val challenge = ByteArrayOutputStream()
     private val notifyQueue = ArrayDeque<UUID>()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scanTimeoutRunnable = Runnable {
+        if (scanning) {
+            scanning = false
+            runCatching { scanner?.stopScan(scanCallback) }
+            Log.w(TAG, "Scan timed out — board not found")
+            emitStatus(
+                "error",
+                "Board not found. Make sure it's on and not connected to the OneWheel app.",
+            )
+        }
+    }
 
     // Latest board values.
     private var sBattery = 0
@@ -162,6 +183,7 @@ class OwPebbleBridgePlugin : Plugin() {
         val connected = call.getBoolean("connected", false) == true
         val battery = (call.getInt("battery", 0) ?: 0).coerceIn(0, 100)
         val speed = (call.getInt("speed", 0) ?: 0).coerceIn(0, 65535)
+        ensureAppLaunched()
         scope.launch {
             try {
                 val result = sendToWatch(connected, battery, speed)
@@ -169,6 +191,7 @@ class OwPebbleBridgePlugin : Plugin() {
                 ret.put("result", result)
                 call.resolve(ret)
             } catch (e: Exception) {
+                Log.e(TAG, "send failed", e)
                 call.reject("send failed: ${e.message}", e)
             }
         }
@@ -185,6 +208,22 @@ class OwPebbleBridgePlugin : Plugin() {
             emitStatus("error", "Bluetooth is off")
             return
         }
+
+        // The OneWheel often does NOT advertise its 128-bit service UUID, and
+        // when it's already linked to the phone it may not be advertising at
+        // all. So first look for a board that the system already has a GATT
+        // connection to and connect straight to it.
+        val already = runCatching {
+            manager.getConnectedDevices(BluetoothProfile.GATT)
+        }.getOrDefault(emptyList()).firstOrNull { isOneWheel(it.name, null) }
+        if (already != null) {
+            Log.d(TAG, "Connecting to already-linked board ${already.name} ${already.address}")
+            emitStatus("connecting", "Connecting to ${already.name ?: already.address}…")
+            gatt = already.connectGatt(context, false, gattCallback)
+            call.resolve()
+            return
+        }
+
         val bleScanner = adapter.bluetoothLeScanner
         if (bleScanner == null) {
             call.reject("BLE scanner unavailable")
@@ -194,29 +233,42 @@ class OwPebbleBridgePlugin : Plugin() {
         scanning = true
         emitStatus("scanning", "Searching for board…")
 
-        val filters = listOf(
-            ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build(),
-        )
+        // No service filter: many OneWheel boards don't advertise the service
+        // UUID, so we scan broadly and match by name / scan-record below.
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        bleScanner.startScan(filters, settings, scanCallback)
+        bleScanner.startScan(null, settings, scanCallback)
+        mainHandler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
         call.resolve()
+    }
+
+    /** True if the advertised name / services look like a OneWheel board. */
+    private fun isOneWheel(name: String?, serviceUuids: List<ParcelUuid>?): Boolean {
+        val n = name?.lowercase().orEmpty()
+        if (n.startsWith("ow") || n.contains("onewheel")) return true
+        return serviceUuids?.any { it.uuid == SERVICE } == true
     }
 
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!scanning) return
-            scanning = false
-            scanner?.stopScan(this)
             val device: BluetoothDevice = result.device
-            emitStatus("connecting", "Connecting to ${device.name ?: device.address}…")
+            val name = device.name ?: result.scanRecord?.deviceName
+            if (!isOneWheel(name, result.scanRecord?.serviceUuids)) return
+            scanning = false
+            mainHandler.removeCallbacks(scanTimeoutRunnable)
+            scanner?.stopScan(this)
+            Log.d(TAG, "Matched board $name ${device.address}")
+            emitStatus("connecting", "Connecting to ${name ?: device.address}…")
             gatt = device.connectGatt(context, false, gattCallback)
         }
 
         override fun onScanFailed(errorCode: Int) {
             scanning = false
+            mainHandler.removeCallbacks(scanTimeoutRunnable)
+            Log.w(TAG, "Scan failed ($errorCode)")
             emitStatus("error", "Scan failed ($errorCode)")
         }
     }
@@ -229,6 +281,8 @@ class OwPebbleBridgePlugin : Plugin() {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     emitStatus("connecting", "Discovering services…")
+                    // Make sure the watch app is open so it can receive data.
+                    ensureAppLaunched()
                     g.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -286,7 +340,9 @@ class OwPebbleBridgePlugin : Plugin() {
             if (geminiUnlock && charUuid == CHAR_SERIAL_READ) {
                 // Step 3: trigger the challenge by writing the firmware char onto itself.
                 val service = g.getService(SERVICE)
-                service?.getCharacteristic(CHAR_FIRMWARE)?.let { writeChar(g, it, it.value ?: ByteArray(0)) }
+                service?.getCharacteristic(CHAR_FIRMWARE)?.let {
+                    writeChar(g, it, firmwareValue ?: it.value ?: ByteArray(0))
+                }
             } else {
                 // Continue enabling the next data notification (battery, then rpm).
                 notifyNext(g)
@@ -308,7 +364,9 @@ class OwPebbleBridgePlugin : Plugin() {
     @SuppressLint("MissingPermission")
     private fun handleRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
         if (c.uuid != CHAR_FIRMWARE) return
+        firmwareValue = value.copyOf()
         val fw = uint16(value)
+        Log.d(TAG, "Firmware revision = $fw")
         if (fw >= GEMINI_FW_MIN) {
             // Step 2: enable notifications on the UART serial-read characteristic.
             geminiUnlock = true
@@ -427,7 +485,19 @@ class OwPebbleBridgePlugin : Plugin() {
             KEY_BATTERY to PebbleDictionaryItem.UInt8(battery.coerceIn(0, 100)),
             KEY_SPEED to PebbleDictionaryItem.UInt16(speedTenths.coerceIn(0, 65535)),
         )
-        return sender.sendDataToPebble(APP_UUID, data).toString()
+        val result = sender.sendDataToPebble(APP_UUID, data).toString()
+        Log.d(TAG, "sendToWatch connected=$connected battery=$battery speed=$speedTenths -> $result")
+        return result
+    }
+
+    /** Launch the watch app once so it is open and able to receive AppMessages. */
+    private fun ensureAppLaunched() {
+        if (appLaunched) return
+        appLaunched = true
+        scope.launch {
+            runCatching { sender.startAppOnTheWatch() }
+                .onFailure { Log.w(TAG, "startAppOnTheWatch failed", it) }
+        }
     }
 
     private fun emitStatus(status: String, message: String) {
@@ -447,6 +517,7 @@ class OwPebbleBridgePlugin : Plugin() {
 
     @SuppressLint("MissingPermission")
     private fun teardown(reason: String) {
+        mainHandler.removeCallbacks(scanTimeoutRunnable)
         runCatching { if (scanning) scanner?.stopScan(scanCallback) }
         scanning = false
         runCatching { gatt?.disconnect() }
@@ -454,6 +525,8 @@ class OwPebbleBridgePlugin : Plugin() {
         gatt = null
         geminiUnlock = false
         keySent = false
+        firmwareValue = null
+        appLaunched = false
         challenge.reset()
         notifyQueue.clear()
         sConnected = false
