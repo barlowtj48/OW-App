@@ -15,9 +15,12 @@
       <h1>OneWheel Companion</h1>
 
       <section class="card">
-        <h2>Watch link</h2>
+        <div class="card-head">
+          <h2>Board</h2>
+          <span id="dot" class="dot"></span>
+        </div>
         <p class="hint">
-          Phase 2 test: push values to the watch over PebbleKit (no board yet).
+          Connect to your Onewheel+ XR and relay live data to the watch.
         </p>
 
         <div class="readout">
@@ -30,6 +33,20 @@
             <span id="speed" class="value">-- mph</span>
           </div>
         </div>
+
+        <div class="buttons">
+          <button id="connectBtn">Connect</button>
+          <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+
+        <p id="status" class="status">Idle</p>
+      </section>
+
+      <details class="card devpanel">
+        <summary>Developer test (no board)</summary>
+        <p class="hint">
+          Push manual values straight to the watch over PebbleKit.
+        </p>
 
         <label class="row">
           <span>Battery %</span>
@@ -45,8 +62,8 @@
           <button id="streamBtn">Start stream</button>
         </div>
 
-        <p id="status" class="status">Idle</p>
-      </section>
+        <p id="devStatus" class="status">Idle</p>
+      </details>
     </main>
 
     <script src="app.js"></script>

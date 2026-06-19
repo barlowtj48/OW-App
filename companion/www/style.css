@@ -35,6 +35,48 @@ h1 {
     padding: 18px;
 }
 
+.card + .card {
+    margin-top: 16px;
+}
+
+.card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex: none;
+}
+
+.dot.scanning,
+.dot.connecting {
+    background: #f5a623;
+}
+
+.dot.connected {
+    background: #3ddc84;
+}
+
+.dot.error {
+    background: #ff5252;
+}
+
+.devpanel summary {
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    list-style: revert;
+}
+
+.devpanel[open] summary {
+    margin-bottom: 8px;
+}
+
 h2 {
     font-size: 16px;
     margin: 0 0 4px;
