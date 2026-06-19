@@ -1,17 +1,19 @@
 {
-    "author": "Moddable",
+    "author": "barlowtj48",
     "dependencies": {},
     "keywords": [
-        "pebble-app"
+        "pebble-app",
+        "onewheel"
     ],
-    "name": "hello-connected.",
+    "name": "ow-app",
     "pebble": {
-        "displayName": "JS Connected",
-        "enableMultiJS": true,
+        "displayName": "OneWheel",
         "messageKeys": [
-            "dummy"
+            "Connected",
+            "BatteryPercent",
+            "Speed"
         ],
-        "projectType": "moddable",
+        "projectType": "native",
         "resources": {
             "media": []
         },
