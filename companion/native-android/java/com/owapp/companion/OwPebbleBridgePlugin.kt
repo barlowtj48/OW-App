@@ -84,6 +84,17 @@ class OwPebbleBridgePlugin : Plugin() {
         // Stop searching after this long if the board never shows up.
         private const val SCAN_TIMEOUT_MS = 15000L
 
+        // Re-read battery/speed this often while connected. An idle board only
+        // notifies its data characteristics when a value *changes*, so a direct
+        // read can return stale 0s; polling keeps the readout fresh and also
+        // recovers if the first read raced the unlock handshake.
+        private const val POLL_INTERVAL_MS = 1500L
+
+        // Never try to (re)launch the watch app more than once per this window.
+        // Relaunching on every failed send is what made the watchapp restart
+        // over and over.
+        private const val LAUNCH_COOLDOWN_MS = 20000L
+
         // Must match the watch app's UUID (package.json).
         private val APP_UUID = UUID.fromString("44bd15cb-2134-41d8-9af8-cbda0d9dd4d9")
 
@@ -135,12 +146,14 @@ class OwPebbleBridgePlugin : Plugin() {
     private var keySent = false
     private var firmwareValue: ByteArray? = null
     private var launchingApp = false
+    private var lastLaunchAttemptMs = 0L
+    private var polling = false
     private val loggedScans = HashSet<String>()
     private val challenge = ByteArrayOutputStream()
     private val notifyQueue = ArrayDeque<UUID>()
     private val readQueue = ArrayDeque<UUID>()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val scanTimeoutRunnable = Runnable {
+    private val scanTimeoutRunnable: Runnable = Runnable {
         if (scanning) {
             scanning = false
             runCatching { scanner?.stopScan(scanCallback) }
@@ -149,6 +162,17 @@ class OwPebbleBridgePlugin : Plugin() {
                 "error",
                 "Board not found. Make sure it's on and not connected to the OneWheel app.",
             )
+        }
+    }
+
+    // Periodically re-read battery/speed so an idle board (which only notifies
+    // on change) still shows live values.
+    @SuppressLint("MissingPermission")
+    private val pollRunnable: Runnable = Runnable {
+        val g = gatt
+        if (g != null && polling) {
+            startInitialReads(g)
+            mainHandler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
         }
     }
 
@@ -265,7 +289,7 @@ class OwPebbleBridgePlugin : Plugin() {
         return serviceUuids?.any { it.uuid == SERVICE } == true
     }
 
-    private val scanCallback = object : ScanCallback() {
+    private val scanCallback: ScanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!scanning) return
@@ -363,11 +387,14 @@ class OwPebbleBridgePlugin : Plugin() {
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             val charUuid = descriptor.characteristic.uuid
+            Log.d(TAG, "descriptor write for $charUuid status=$status")
             if (geminiUnlock && charUuid == CHAR_SERIAL_READ) {
                 // Step 3: trigger the challenge by writing the firmware char onto itself.
                 val service = g.getService(SERVICE)
+                val fw = firmwareValue ?: service?.getCharacteristic(CHAR_FIRMWARE)?.value ?: ByteArray(0)
+                Log.d(TAG, "unlock: writing firmware ${fw.toHex()} to trigger challenge")
                 service?.getCharacteristic(CHAR_FIRMWARE)?.let {
-                    writeChar(g, it, firmwareValue ?: it.value ?: ByteArray(0))
+                    writeChar(g, it, fw)
                 }
             } else {
                 // Continue enabling the next data notification (battery, then rpm).
@@ -378,7 +405,10 @@ class OwPebbleBridgePlugin : Plugin() {
         @SuppressLint("MissingPermission")
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
             if (c.uuid == CHAR_SERIAL_WRITE) {
-                // Step 5: unlock response accepted — start streaming live data.
+                // Step 5: unlock response written (status=0 means the board
+                // accepted the GATT write; it does not guarantee the key itself
+                // was correct — watch for battery/rpm notifications to confirm).
+                Log.d(TAG, "unlock: response write status=$status (0=ok); starting data notifications")
                 emitStatus("connected", "Connected")
                 startDataNotifications(g)
             }
@@ -426,6 +456,7 @@ class OwPebbleBridgePlugin : Plugin() {
                 if (keySent) return
                 challenge.write(value, 0, value.size)
                 val inkey = challenge.toByteArray()
+                Log.d(TAG, "unlock: challenge chunk ${value.toHex()} (have ${inkey.size}/20)")
                 if (inkey.size >= 20) {
                     keySent = true
                     respondToChallenge(g, inkey)
@@ -460,6 +491,7 @@ class OwPebbleBridgePlugin : Plugin() {
             var check = 0
             for (b in body) check = check xor b.toInt()
             val outkey = body + check.toByte() // 20 bytes
+            Log.d(TAG, "unlock: challenge=${inkey.toHex()} -> response=${outkey.toHex()}")
 
             val service = g.getService(SERVICE)
             service?.getCharacteristic(CHAR_SERIAL_WRITE)?.let { writeChar(g, it, outkey) }
@@ -484,8 +516,9 @@ class OwPebbleBridgePlugin : Plugin() {
         if (next == null) {
             // All notifications enabled — prime the UI with one read of each
             // value, since an idle board won't push a notification until
-            // something changes.
+            // something changes, then keep polling so it stays fresh.
             startInitialReads(g)
+            startPolling()
             return
         }
         val service = g.getService(SERVICE)
@@ -498,6 +531,12 @@ class OwPebbleBridgePlugin : Plugin() {
         readQueue.add(CHAR_BATTERY)
         readQueue.add(CHAR_SPEED_RPM)
         readNext(g)
+    }
+
+    private fun startPolling() {
+        if (polling) return
+        polling = true
+        mainHandler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
     }
 
     @SuppressLint("MissingPermission")
@@ -562,25 +601,38 @@ class OwPebbleBridgePlugin : Plugin() {
      */
     private suspend fun deliverToWatch(connected: Boolean, battery: Int, speedTenths: Int): String {
         var result = sendToWatch(connected, battery, speedTenths)
-        if (needsAppLaunch(result) && !launchingApp) {
-            launchingApp = true
-            try {
-                logWatchDiagnostics()
-                Log.d(TAG, "Launching watch app $APP_UUID (watch had a different app open)")
-                val launch = runCatching { sender.startAppOnTheWatch(APP_UUID).toString() }
-                    .getOrElse { "error: ${it.message}" }
-                Log.d(TAG, "startAppOnTheWatch -> $launch")
-                // The watch takes a moment to bring the app to the foreground
-                // and for the Core app's state to catch up, so retry a few times.
-                for (attempt in 1..6) {
-                    delay(1000)
-                    result = sendToWatch(connected, battery, speedTenths)
-                    if (!needsAppLaunch(result)) break
-                    Log.d(TAG, "watch send retry $attempt -> $result")
-                }
-            } finally {
-                launchingApp = false
+        if (!needsAppLaunch(result)) return result
+
+        // FailedDifferentAppOpen means the Pebble phone app has no PebbleKit2
+        // companion session for our UUID. The Core app only creates that session
+        // when our watchapp is its locker app AND the cached PBW's appinfo.json
+        // declares companionApp.android.apps[].package; opening the app then
+        // binds our OwPebbleListenerService. We can nudge it by launching the
+        // app, but we must do so SPARINGLY: relaunching on every failed send is
+        // what made the watchapp restart over and over. So launch at most once
+        // per cooldown, and NEVER stop the app first.
+        val now = System.currentTimeMillis()
+        if (launchingApp || now - lastLaunchAttemptMs < LAUNCH_COOLDOWN_MS) {
+            return result
+        }
+        launchingApp = true
+        lastLaunchAttemptMs = now
+        try {
+            logWatchDiagnostics()
+            Log.d(TAG, "Launching watch app to establish companion session ($APP_UUID)")
+            val launch = runCatching { sender.startAppOnTheWatch(APP_UUID).toString() }
+                .getOrElse { "error: ${it.message}" }
+            Log.d(TAG, "startAppOnTheWatch -> $launch")
+            // Give the watch a moment to bring the app to the foreground and for
+            // the Core app to bind our listener / register the session.
+            for (attempt in 1..3) {
+                delay(1200)
+                result = sendToWatch(connected, battery, speedTenths)
+                if (!needsAppLaunch(result)) break
+                Log.d(TAG, "watch send retry $attempt -> $result")
             }
+        } finally {
+            launchingApp = false
         }
         return result
     }
@@ -633,6 +685,8 @@ class OwPebbleBridgePlugin : Plugin() {
     @SuppressLint("MissingPermission")
     private fun teardown(reason: String) {
         mainHandler.removeCallbacks(scanTimeoutRunnable)
+        mainHandler.removeCallbacks(pollRunnable)
+        polling = false
         runCatching { if (scanning) scanner?.stopScan(scanCallback) }
         scanning = false
         runCatching { gatt?.disconnect() }

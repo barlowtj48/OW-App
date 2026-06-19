@@ -102,6 +102,38 @@ configurations.all {
   return out;
 });
 
+// 2b) AndroidManifest.xml: declare the PebbleKit2 listener service. This is
+// REQUIRED for the selected Pebble phone app to register a companion session for
+// our watchapp. Without it, every sendDataToPebble fails with
+// FailedDifferentAppOpen even though our app is foreground on the watch.
+patch(join(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml'), 'AndroidManifest.xml (listener service)', (src) => {
+  if (src.includes('com.owapp.companion.OwPebbleListenerService')) return src;
+
+  // Ensure the `tools` namespace is available so we can suppress the
+  // ExportedService lint warning on the intent-filtered service.
+  let out = src;
+  if (!out.includes('xmlns:tools=')) {
+    out = out.replace(
+      '<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+      '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n    xmlns:tools="http://schemas.android.com/tools">',
+    );
+  }
+
+  const service = `
+        <!-- PebbleKit2 listener: lets the Pebble phone app establish a companion
+             session for our watchapp so phone->watch AppMessages can be sent. -->
+        <service
+            android:name="com.owapp.companion.OwPebbleListenerService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="io.rebble.pebblekit2.RECEIVE_DATA_FROM_WATCH" />
+            </intent-filter>
+        </service>
+`;
+  return out.replace(/\n    <\/application>/, `${service}    </application>`);
+});
+
 // 3) Copy the Kotlin sources in, replacing the generated Java MainActivity.
 mkdirSync(destJavaDir, { recursive: true });
 for (const name of readdirSync(nativeSrcDir)) {
